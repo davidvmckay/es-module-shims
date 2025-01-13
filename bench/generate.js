@@ -1,13 +1,14 @@
 import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { join, sep } from 'path';
 import rimraf from 'rimraf';
+import { fileURLToPath } from 'url';
 
 // GENERATE CASES
 {
   const preact = await readFile(new URL('../node_modules/preact/dist/preact.module.js', import.meta.url));
 
   try {
-    rimraf.sync(new URL('./generated', import.meta.url));
+    rimraf.sync(fileURLToPath(new URL('./generated', import.meta.url)));
   }
   catch {}
 
@@ -50,7 +51,9 @@ import rimraf from 'rimraf';
 
   // GENERATE ALLMAPPED TESTS
   for (const n of [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 1000]) {
-    const imports = {};
+    const imports = {
+      mapped: 'data:text/javascript,'
+    };
     for (let i = 1; i <= n; i++) {
       imports[`lib/app.mapped${i}.js`] = `/bench/generated/app.mapped${i}.js`;
       imports[`lib/preact.js?n=${i}`] = `/bench/generated/preact.js?n=${i}`;
@@ -78,7 +81,7 @@ import rimraf from 'rimraf';
 </script>
 <script async src="/dist/es-module-shims.js"></script>
 <script type="module">
-  import 'lib/app.mapped1.js';
+  import 'mapped';
   let promises = Array(${n});
   for (let i = 1; i <= ${n}; i++)
     promises.push(import(\`lib/app.mapped\${i}.js\`));
@@ -91,9 +94,6 @@ import rimraf from 'rimraf';
 // GENERATE BENCHMARKS
 
 {
-  try { await mkdir(new URL('./results', import.meta.url)) }
-  catch {}
-
   try { rimraf.sync(new URL('./benchmarks', import.meta.url)) }
   catch {}
 
@@ -102,12 +102,12 @@ import rimraf from 'rimraf';
 
   const ports = {
     'fastest': 8000,
-    'fastest-cached': 8001,
+    // 'fastest-cached': 8001,
     'slow': 8002,
     // 'slow-uncompressed': 8003
   };
 
-  for (const browser of ['safari', 'firefox', 'chrome']) {
+  for (const browser of [/*'safari', */'firefox', 'chrome']) {
     let firefoxProfilePath;
     if (browser === 'firefox' && process.env.APPDATA) {
       // TODO: Firefox profile path for other platforms
@@ -210,7 +210,7 @@ import rimraf from 'rimraf';
                 "name": "${browser}"${browser === 'firefox' ? `,
                 "profile": ${JSON.stringify(firefoxProfilePath)}` : ''}
               }
-            }${type.startsWith('slow') ? '' : `,
+            }${true ? '' : `,
             {
               "name": "${fullName}-1000",
               "url": "runner.html?type=${name}&n=1000&port=${port}",

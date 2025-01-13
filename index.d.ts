@@ -6,9 +6,17 @@ interface ESMSInitOptions {
 
   /**
    * Enable polyfill features.
-   * Currently supports ['css-modules', 'json-modules']
+   * Currently supports ['css-modules', 'json-modules', 'wasm-modules', 'source-phase']
    */
-  polyfillEnable?: string[];
+  polyfillEnable?: Array<'css-modules' | 'json-modules' | 'wasm-modules' | 'source-phase'>
+
+  /**
+   * #### Enforce Integrity
+   *
+   * Set to *true* to enable secure mode to not support loading modules without integrity (integrity is always verified though).
+   *
+   */
+  enforceIntegrity?: boolean;
 
   /**
    * Nonce for CSP build
@@ -16,9 +24,14 @@ interface ESMSInitOptions {
   nonce?: boolean;
 
   /**
-   * Disable retriggering of document readystate
+   * Disable retriggering of document readystate and DOMContentLoaded
    */
-  noLoadEventRetriggers: true,
+  noLoadEventRetriggers?: boolean;
+
+  /**
+   * Enable retriggering of the Window / global 'load' event
+   */
+  globalLoadEventRetrigger?: boolean;
 
   /**
    * #### Skip Processing Stability
@@ -41,28 +54,40 @@ interface ESMSInitOptions {
    * By default, this expression supports jspm.dev, dev.jspm.io and
    * cdn.pika.dev.
    */
-  skip: RegExp;
+  skip?: RegExp | string[] | string
 
   /**
    * #### Error hook
-   * 
+   *
    * Register a callback for any ES Module Shims module errors.
-   * 
+   *
    */
-  onerror: (e: any) => any;
+  onerror?: (e: any) => any;
+
+  /**
+   * #### Polyfill hook
+   *
+   * Register a callback invoked when polyfill mode first engages.
+   *
+   */
+  onpolyfill?: () => void;
 
   /**
    * #### Resolve Hook
-   * 
+   *
    * Only supported in Shim Mode.
-   * 
+   *
    * Provide a custom resolver function.
    */
-  resolve: (id: string, parentUrl: string, resolve: (id: string, parentUrl: string) => string) => string | Promise<string>;
+  resolve?: (
+    id: string,
+    parentUrl: string,
+    resolve: (id: string, parentUrl: string) => string
+  ) => string | Promise<string>;
 
   /**
    * #### Fetch Hook
-   * 
+   *
    * Only supported in Shim Mode.
    *
    * > Stability: Non-spec feature
@@ -122,16 +147,46 @@ interface ESMSInitOptions {
    * }
    * ```
    */
-  fetch: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
+  fetch?: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
 
   /**
    * #### Revoke Blob URLs
-   * 
+   *
    * Set to *true* to cleanup blob URLs from memory after execution.
    * Can cost some compute time for large loads.
-   * 
+   *
    */
-  revokeBlobURLs: boolean;
+  revokeBlobURLs?: boolean;
+
+  /**
+   * #### Map Overrides
+   *
+   * Set to *true* to permit overrides to import maps.
+   *
+   */
+  mapOverrides?: boolean;
+
+  /**
+  * #### Meta hook
+  *
+  * Register a callback for import.meta construction.
+  *
+  */
+  meta?: (meta: any, url: string) => void;
+
+  /**
+   * #### On import hook
+   *
+   * Register a callback for top-level imports.
+   *
+   */
+  onimport?: (url: string, options: any, parentUrl: string) => void;
+}
+
+interface ImportMap {
+  imports: Record<string, string>;
+  scopes: Record<string, Record<string, string>>;
+  integrity: Record<string, string>;
 }
 
 /**
@@ -150,6 +205,12 @@ declare function importShim<Default, Exports extends object>(
   specifier: string,
   parentUrl?: string
 ): Promise<{ default: Default } & Exports>;
+
+declare namespace importShim {
+  const resolve: (id: string, parentURL?: string) => string;
+  const addImportMap: (importMap: Partial<ImportMap>) => void;
+  const getImportMap: () => ImportMap;
+}
 
 interface Window {
   esmsInitOptions?: ESMSInitOptions;
