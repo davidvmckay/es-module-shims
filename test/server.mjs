@@ -5,9 +5,9 @@ import path from "path";
 import {fileURLToPath} from "url";
 import open from "open";
 import kleur from 'kleur';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 
-const port = 8080;
+const port = parseInt(process.env.CI_PORT || '8080');
 
 const rootURL = new URL("..", import.meta.url);
 
@@ -17,20 +17,17 @@ const mimes = {
   '.js': 'application/javascript',
   '.mjs': 'application/javascript',
   '.json': 'application/json',
-  '.wasm': 'application/wasm'
+  '.wasm': 'application/wasm',
+  '.ts': 'application/typescript'
 };
 
 const shouldExit = process.env.WATCH_MODE !== 'true';
-const testName = process.env.TEST_NAME ?? 'test';
+const testName = process.argv[2] ?? 'test-shim';
 
 let retry = 0;
 
 // Dont run Chrome tests on Firefox
 if (testName.startsWith('test-chrome') && process.env.CI_BROWSER && !process.env.CI_BROWSER.includes('chrome'))
-  process.exit(0);
-
-// Dont run CSP tests on old Firefox
-if (testName.startsWith('test-csp') && process.env.CI_BROWSER && process.env.CI_BROWSER.includes('firefox') && (process.env.CI_BROWSER.includes('60') || process.env.CI_BROWSER.includes('67')))
   process.exit(0);
 
 let failTimeout, browserTimeout;
@@ -48,14 +45,16 @@ function setBrowserTimeout () {
     }
     else {
       console.log('Retrying...');
+      setBrowserTimeout();
       start();
     }
-  }, 20000);
+  }, 60_000);
 }
 
 setBrowserTimeout();
 
-http.createServer(async function (req, res) {
+let latestStartTitle;
+const server = http.createServer(async function (req, res) {
   // Helps CI debugging:
   if (process.env.CI_BROWSER)
     console.log("REQ: " + req.url);
@@ -63,6 +62,9 @@ http.createServer(async function (req, res) {
   if (req.url.startsWith('/done')) {
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('');
+    if (latestStartTitle) {
+      console.log(kleur.yellow('Starting ') + latestStartTitle);
+    }
     console.log(kleur.green('Tests completed successfully.'));
     if (browserTimeout)
       clearTimeout(browserTimeout);
@@ -76,11 +78,41 @@ http.createServer(async function (req, res) {
     return;
   }
   else if (req.url.startsWith('/error?')) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('');
+    if (latestStartTitle) {
+      console.log(kleur.yellow('Starting ') + latestStartTitle);
+    }
     const msg = decodeURIComponent(req.url.slice(7));
-    console.log(kleur.red('Test failure: ') + msg);
+    console.log(kleur.red('Test failures: ') + msg);
     if (shouldExit) {
       failTimeout = setTimeout(() => process.exit(1), 30000);
     }
+    return;
+  }
+  else if (req.url.startsWith('/mocha/start?')) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('');
+    latestStartTitle = decodeURIComponent(req.url.slice(15));
+    return;
+  }
+  else if (req.url.startsWith('/mocha/pass?')) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('');
+    const fullTitle = decodeURIComponent(req.url.slice(14));
+    console.log(kleur.green('Pass ') + fullTitle);
+    latestStartTitle = undefined;
+    return;
+  }
+  else if (req.url.startsWith('/mocha/fail?')) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('');
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    const fullTitle = u.searchParams.get('t');
+    const msg = u.searchParams.get('e');
+    console.log(kleur.red('Fail ') + fullTitle + ': ' + msg);
+    latestStartTitle = undefined;
+    return;
   }
   else if (failTimeout) {
     clearTimeout(failTimeout);
@@ -122,24 +154,35 @@ http.createServer(async function (req, res) {
     mime = mimes[path.extname(filePath)] || 'text/plain';
 
   const headers = filePath.endsWith('content-type-none.json') ?
-    {} : { 'content-type': mime, 'Cache-Control': 'no-cache' }
+    {} : { 'Access-Control-Allow-Origin': '*', 'Content-Type': mime, 'Cache-Control': 'no-cache' }
 
   res.writeHead(200, headers);
   fileStream.pipe(res);
   await once(fileStream, 'end');
   res.end();
-}).listen(port);
+});
 
 let spawnPs;
-function start () {
+let baseURL;
+async function start () {
   if (process.env.CI_BROWSER) {
     const args = process.env.CI_BROWSER_FLAGS ? process.env.CI_BROWSER_FLAGS.split(' ') : [];
+    if (process.env.CI_BROWSER_FLUSH) {
+      console.log('Flushing browser: ' + process.env.CI_BROWSER_FLUSH);
+      try { execSync(process.env.CI_BROWSER_FLUSH) } catch (e) {
+        console.log(e);
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
     console.log('Spawning browser: ' + process.env.CI_BROWSER + ' ' + args.join(' '));
-    spawnPs = spawn(process.env.CI_BROWSER, [...args, `http://localhost:${port}/test/${testName}.html`]);
+    spawnPs = spawn(process.env.CI_BROWSER, [...args, `${baseURL}/test/${testName}.html`]);
   }
   else {
-    open(`http://localhost:${port}/test/${testName}.html`, { app: { name: open.apps.chrome } });
+    open(`${baseURL}/test/${testName}.html`, { app: { name: open.apps[process.env.BROWSER || 'chrome'] } });
   }
 }
 
-start();
+server.listen(port, 'localhost', function() {
+  baseURL = `http://localhost:${server.address().port}`;
+  start();
+});

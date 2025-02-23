@@ -1,5 +1,3 @@
-const edge = !!navigator.userAgent.match(/Edge\/\d\d\.\d+$/);
-
 self.baseURL = location.href.substr(0, location.href.lastIndexOf('/') + 1);
 
 suite('Basic loading tests', () => {
@@ -67,15 +65,12 @@ suite('Basic loading tests', () => {
 
   test('should resolve various import syntax', async function () {
     var m = await importShim('./fixtures/es-modules/import.js');
-    if (!edge)
-      assert.equal(typeof m.a, 'function');
+    assert.equal(typeof m.a, 'function');
     assert.equal(m.b, 4);
     assert.equal(m.c, 5);
     assert.equal(m.d, 4);
-    if (!edge) {
-      assert.equal(typeof m.q, 'object');
-      assert.equal(typeof m.q.foo, 'function');
-    }
+    assert.equal(typeof m.q, 'object');
+    assert.equal(typeof m.q.foo, 'function');
   });
 
   test('should support import.meta.url', async function () {
@@ -85,7 +80,7 @@ suite('Basic loading tests', () => {
 
   test('should support import assertions', async function () {
     var m = await importShim('./fixtures/json-assertion.js');
-    assert.equal(m.m, 'module');
+    assert.equal(m.m.json, 'module');
   });
 
   test('should support css imports', async function () {
@@ -116,6 +111,16 @@ suite('Basic loading tests', () => {
     await p;
   });
 
+  test('should support relative dynamic import', async function () {
+    const result = await (await importShim('./fixtures/test-rel-dynamic.js')).default;
+    assert.equal(result.hello, 'world');
+  });
+
+  test('should support nested import.meta.url in dynamic import', async function () {
+    const result = await (await importShim('./fixtures/test-nested-dynamic.js')).default;
+    assert.ok(result.default.endsWith('test-nested-dynamic.js'));
+  });
+
   test('Should import a module via a full url, with scheme', async function () {
     const url = window.location.href.replace('/test-shim.html', '/fixtures/es-modules/no-imports.js');
     assert.equal(url.slice(0, 4), 'http');
@@ -125,7 +130,7 @@ suite('Basic loading tests', () => {
   });
 
   test('Should import a module via a full url, without scheme', async function () {
-    const url = window.location.href
+    const url = window.location.href.split('#')[0].split('?')[0]
       .replace('/test-shim.html', '/fixtures/es-modules/no-imports.js')
       .replace(/^http(s)?:/, '');
     assert.equal(url.slice(0, 2), '//');
@@ -135,7 +140,7 @@ suite('Basic loading tests', () => {
   });
 
   test("Should import a module via a relative path re-mapped with importmap's scopes", async function () {
-    const url = window.location.href
+    const url = window.location.href.split('#')[0].split('?')[0]
       .replace('/test-shim.html', '/fixtures/es-modules/import-relative-path.js');
     var m = await importShim(url);
     assert(m);
@@ -165,9 +170,22 @@ suite('Basic loading tests', () => {
 });
 
 suite('Circular dependencies', function() {
+  test('Should handle self-import tdzs', async function () {
+    var m = await importShim('./fixtures/es-modules/tdz.js');
+    assert.equal(m.checkTDZ(), 'tdz');
+  });
+
   test('should resolve circular dependencies', async function () {
     var m = await importShim('./fixtures/test-cycle.js');
     assert.equal(m.default, 'f');
+  });
+
+  test('should support shell update import interleaving', async function () {
+    var m = await importShim('./fixtures/test-self-import.js');
+    assert.equal(m.default.length, 3);
+    assert.equal(m.default[0], 5);
+    assert.equal(m.default[1], 6);
+    assert.equal(m.default[2], 7);
   });
 });
 
@@ -246,14 +264,14 @@ suite('Export variations', function () {
 
   test('import meta resolve', async function () {
     var m = await importShim('./fixtures/es-modules/import-meta-resolve.js');
-    assert.equal(await m.resolve('./export-star2.js'), new URL('./export-star2.js', m.url).href);
-    assert.equal(await m.resolve('test'), new URL('/test/fixtures/es-modules/es6-file.js', m.url).href);
-    assert.equal(await m.resolve('test/'), new URL('/test/fixtures/', m.url).href);
-    assert.equal(await m.resolve('test/sub/'), new URL('/test/fixtures/sub/', m.url).href);
-    assert.equal(await m.resolve('test/custom.css'), new URL('/test/fixtures/custom.css', m.url).href);
-    assert.equal(await m.resolve('test-dep'), new URL('/test/fixtures/test-dep.js', m.url).href);
+    assert.equal(m.resolve('./export-star2.js'), new URL('./export-star2.js', m.url).href);
+    assert.equal(m.resolve('test'), new URL('/test/fixtures/es-modules/es6-file.js', m.url).href);
+    assert.equal(m.resolve('test/'), new URL('/test/fixtures/', m.url).href);
+    assert.equal(m.resolve('test/sub/'), new URL('/test/fixtures/sub/', m.url).href);
+    assert.equal(m.resolve('test/custom.css'), new URL('/test/fixtures/custom.css', m.url).href);
+    assert.equal(m.resolve('test-dep'), new URL('/test/fixtures/test-dep.js', m.url).href);
     try {
-      await m.resolve('test-dep', new URL('https://other.com'));
+      m.resolve('test-dep', new URL('https://other.com'));
       assert(false);
     }
     catch (e) {
@@ -268,26 +286,27 @@ suite('Get import map', () => {
     const importMap = await importShim.getImportMap();
 
     const sortEntriesByKey = (entries) => [...entries].sort(([key1], [key2]) => key1.localeCompare(key2));
+    const baseURL = document.location.href.replace(/\/test\/.*/, '/');
 
-    assert.equal(JSON.stringify(Object.keys(importMap)), JSON.stringify(["imports", "scopes"]));
+    assert.equal(JSON.stringify(Object.keys(importMap)), JSON.stringify(["imports", "scopes", "integrity"]));
     assert.equal(
-      JSON.stringify(sortEntriesByKey(Object.entries(importMap.imports))), 
+      JSON.stringify(sortEntriesByKey(Object.entries(importMap.imports))),
       JSON.stringify(sortEntriesByKey(Object.entries({
-        "test": "http://localhost:8080/test/fixtures/es-modules/es6-file.js",
-        "test/": "http://localhost:8080/test/fixtures/",
-        "global1": "http://localhost:8080/test/fixtures/es-modules/global1.js",
-        "bare-dynamic-import": "http://localhost:8080/test/fixtures/es-modules/bare-dynamic-import.js",
+        "test": baseURL + "test/fixtures/es-modules/es6-file.js",
+        "test/": baseURL + "test/fixtures/",
+        "global1": baseURL + "test/fixtures/es-modules/global1.js",
+        "bare-dynamic-import": baseURL + "test/fixtures/es-modules/bare-dynamic-import.js",
         "react": "https://ga.jspm.io/npm:react@17.0.2/dev.index.js"
       })))
     );
     assert.equal(
-      JSON.stringify(sortEntriesByKey(Object.entries(importMap.scopes))), 
+      JSON.stringify(sortEntriesByKey(Object.entries(importMap.scopes))),
       JSON.stringify(sortEntriesByKey(Object.entries({
-        "http://localhost:8080/": {
-          "test-dep": "http://localhost:8080/test/fixtures/test-dep.js",
+        [baseURL]: {
+          "test-dep": baseURL + "test/fixtures/test-dep.js",
         },
-        "http://localhost:8080/test/fixtures/es-modules/import-relative-path.js": {
-          "http://localhost:8080/test/fixtures/es-modules/relative-path": "http://localhost:8080/test/fixtures/es-modules/es6-dep.js",
+        [baseURL + "test/fixtures/es-modules/import-relative-path.js"]: {
+          [baseURL + "test/fixtures/es-modules/relative-path"]: baseURL + "test/fixtures/es-modules/es6-dep.js",
         },
         "https://ga.jspm.io/": {
           "object-assign": "https://ga.jspm.io/npm:object-assign@4.1.1/index.js",
@@ -303,35 +322,41 @@ suite('Errors', function () {
       await importShim(module);
     }
     catch(e) {
-      return e.toString();
+      return e;
     }
     throw new Error('Test supposed to fail');
   }
 
   test('onerror hook worked correctly', async function () {
     await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal(window.e.toString(), 'ReferenceError: syntax is not defined');
+    assert.ok(window.e instanceof ReferenceError);
+    assert.ok(window.e.toString().includes('syntax'));
   });
 
   test('should give a plain name error', async function () {
     var err = await getImportError('plain-name');
-    assert.equal(err.indexOf('Error: Unable to resolve specifier \'plain-name\' imported from'), 0);
+    assert.equal(err.toString().indexOf('Error: Unable to resolve specifier \'plain-name\' imported from'), 0);
   });
 
   test('should throw if on syntax error', async function () {
     Mocha.process.removeListener('uncaughtException');
     var err = await getImportError('./fixtures/es-modules/main.js');
-    assert.equal(err.toString(), 'dep error');
+    assert.equal(err.toString().toString(), 'dep error');
   });
 
   test('should throw what the script throws', async function () {
     var err = await getImportError('./fixtures/es-modules/deperror.js');
-    assert.equal(err, 'dep error');
+    assert.equal(err.toString(), 'dep error');
   });
 
   test('404 error', async function () {
     var err = await getImportError('./fixtures/es-modules/load-non-existent.js');
-    assert(err.toString().startsWith('Error: 404 Not Found ' + new URL('./fixtures/es-modules/non-existent.js', baseURL).href));
+    assert(err.toString().startsWith('TypeError: 404 Not Found ' + new URL('./fixtures/es-modules/non-existent.js', baseURL).href));
+  });
+
+  test('network error should include response', async function () {
+    var err = await getImportError('./fixtures/es-modules/load-non-existent.js');
+    assert(err.response instanceof Response);
   });
 
   this.timeout(10000);
@@ -346,6 +371,9 @@ suite('Errors', function () {
           "scheduler": "https://ga.jspm.io/npm:scheduler@0.20.2/dev.index.js",
           "scheduler/tracing": "https://ga.jspm.io/npm:scheduler@0.20.2/dev.tracing.js"
         }
+      },
+      "integrity": {
+        "//ga.jspm.io/npm:scheduler@0.20.2/dev.index.js": "sha384-qF0Jy83btjdPADN4QLKKmk/aUUyJnDqT+kYomKiUQk4nWrBsHVkM67Pua+8nHYUt"
       }
     });
     const [React, ReactDOM] = await Promise.all([
@@ -364,53 +392,36 @@ suite('Errors', function () {
     });
     const lodash = await importShim("lodash");
     assert.ok(lodash);
-  })
-
-  test('Dynamic import map shim with override attempt', async function () {
-    const listeningForError = new Promise((resolve, reject) => {
-      window.addEventListener('error', (event) => resolve(event.error))
-      // ensure we don't wait forever in the test if the error never comes
-      setTimeout(reject, 5000)
-    })
-
-    const removeImportMap = insertDynamicImportMap({
-      "imports": {
-        "global1": "data:text/javascript,throw new Error('Shim should not allow dynamic import map to override existing entries');"
-      }
-    });
-
-    const error = await listeningForError;
-
-    removeImportMap();
-
-    assert(error.message === 'Rejected map override "global1" from http://localhost:8080/test/fixtures/es-modules/global1.js to data:text/javascript,throw new Error(\'Shim should not allow dynamic import map to override existing entries\');.');
-  })
+  });
 
   test('Dynamic import map shim with override to the same mapping is allowed', async function () {
     const expectingNoError = new Promise((resolve, reject) => {
-      window.addEventListener('error', (event) => reject(event.error))
+      window.addEventListener('error', (event) => {
+        reject(event.error)
+      });
       // waiting for 1 sec should be enough to make sure the error didn't happen.
       setTimeout(resolve, 1000)
     })
 
+    const baseURL = document.location.href.replace(/\/test\/.*/, '/');
     const removeImportMap = insertDynamicImportMap({
       "imports": {
-        "global1": "http://localhost:8080/test/fixtures/es-modules/global1.js"
+        "global1": baseURL + "test/fixtures/es-modules/global1.js"
       }
     });
 
     await expectingNoError;
 
     removeImportMap();
-  })
+  });
 
   function insertDynamicImportMap(importMap) {
     const script = Object.assign(document.createElement('script'), {
       type: 'importmap-shim',
       innerHTML: JSON.stringify(importMap),
     });
-    document.body.appendChild(script);
-    return () => document.body.removeChild(script);
+    document.head.appendChild(script);
+    return () => document.head.removeChild(script);
   }
 });
 
@@ -418,7 +429,7 @@ suite('Source maps', () => {
   test('should include `//# sourceURL=` directive if one is not present in original module', async () => {
     const moduleURL = new URL("./fixtures/es-modules/without-source-url.js", location.href).href;
     await importShim(moduleURL);
-    const moduleBlobURL = window._esmsr[moduleURL].b
+    const moduleBlobURL = importShim._r[moduleURL].b
     const blobContent = await fetch(moduleBlobURL).then(r => r.text())
     assert(blobContent.includes(`//# sourceURL=${moduleURL}`))
   });
@@ -426,7 +437,7 @@ suite('Source maps', () => {
   test('should replace relative paths in `//# sourceURL=` directive with absolute URL', async () => {
     const moduleURL = new URL('./fixtures/es-modules/with-relative-source-url.js', location.href).href;
     await importShim(moduleURL);
-    const moduleBlobURL = window._esmsr[moduleURL].b;
+    const moduleBlobURL = importShim._r[moduleURL].b;
     const blobContent = await fetch(moduleBlobURL).then(r => r.text());
     const sourceURL = new URL('module.ts', moduleURL).href;
     assert(blobContent.endsWith(`//# sourceURL=${sourceURL}`));
@@ -437,7 +448,7 @@ suite('Source maps', () => {
   test('should replace relative paths in `//# sourceMappingURL=` directive with absolute URL and add `//# sourceURL=`', async () => {
     const moduleURL = new URL('./fixtures/es-modules/with-relative-source-mapping-url.js', location.href).href;
     await importShim(moduleURL);
-    const moduleBlobURL = window._esmsr[moduleURL].b;
+    const moduleBlobURL = importShim._r[moduleURL].b;
     const blobContent = await fetch(moduleBlobURL).then(r => r.text());
     const sourceMappingURL = new URL('./with-relative-source-mapping-url.js.map', moduleURL).href;
     assert(blobContent.endsWith(
@@ -451,7 +462,7 @@ suite('Source maps', () => {
   test('should keep original absolute URL in `//# sourceMappingURL=` directive and add `//# sourceURL=`', async () => {
     const moduleURL = new URL('./fixtures/es-modules/with-absolute-source-mapping-url.js', location.href).href;
     await importShim(moduleURL);
-    const moduleBlobURL = window._esmsr[moduleURL].b;
+    const moduleBlobURL = importShim._r[moduleURL].b;
     const blobContent = await fetch(moduleBlobURL).then(r => r.text());
     assert(blobContent.endsWith(
         `//# sourceMappingURL=https://example.com/module.js.map\n//# sourceURL=${moduleURL}`
@@ -459,6 +470,19 @@ suite('Source maps', () => {
 
     // Should not touch any other occurrences of `//# sourceMappingURL=` in the code.
     assert(blobContent.includes('//# sourceMappingURL=i-should-not-be-affected.no'));
+  });
+
+  test('should preserve existing sourceURL if both sourceURL and sourceMappingURL already exist', async () => {
+    const moduleURL = new URL('./fixtures/es-modules/with-source-url-and-source-mapping-url.js', location.href).href;
+    await importShim(moduleURL);
+    const moduleBlobURL = importShim._r[moduleURL].b;
+    const blobContent = await fetch(moduleBlobURL).then(r => r.text());
+    assert(blobContent.endsWith(
+        `//# sourceURL=${new URL('/with-source-url-and-source-mapping-url.js', window.location.origin)}\n//# sourceMappingURL=https://example.com/module.js.map`
+    ));
+
+    // Should not touch any other occurrences of `//# sourceURL=` in the code.
+    assert(blobContent.includes('//# sourceURL=i-should-not-be-affected.no'));
   });
 });
 

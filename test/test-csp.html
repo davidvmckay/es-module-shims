@@ -1,11 +1,12 @@
 <!doctype html>
-<meta http-equiv="Content-Security-Policy" content="script-src 'self' 'nonce-asdf' unpkg.com;" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'nonce-asdf' 'unsafe-eval' unpkg.com;" />
 <link rel="stylesheet" type="text/css" href="../node_modules/mocha/mocha.css"/>
 <script src="../node_modules/mocha/mocha.js"></script>
-<script src="https://unpkg.com/construct-style-sheets-polyfill@3.0.0/dist/adoptedStyleSheets.js"></script>
+<script src="https://unpkg.com/construct-style-sheets-polyfill@3.1.0/dist/adoptedStyleSheets.js" nonce="asdf"></script>
 <script type="importmap" nonce="asdf">
 {
   "imports": {
+    "once": "/test/fixtures/once.js",
     "test": "/test/fixtures/es-modules/es6-file.js",
     "test/": "/test/fixtures/",
     "global1": "/test/fixtures/es-modules/global1.js",
@@ -23,13 +24,24 @@
   }
 }
 </script>
-<script type="esms-options">
-{
-  "polyfillEnable": ["json-modules", "css-modules"]
-}
+
+<script nonce="asdf">
+  window.noEval = true;
+  window.esmsInitOptions = {
+    polyfillEnable: ['css-modules', 'json-modules', 'wasm-modules', 'source-phase']
+  };
+  window.domLoad = 0;
+  document.addEventListener('DOMContentLoaded', () => {
+    window.domLoad++;
+  });
 </script>
+
 <script nonce="asdf">
   window.import2 = import('data');
+</script>
+
+<script type="module" nonce="asdf">
+  import 'once';
 </script>
 
 <script type="module" src="../src/es-module-shims.js" nonce="asdf"></script>

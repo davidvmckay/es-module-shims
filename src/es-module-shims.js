@@ -1,149 +1,302 @@
-import {
-  resolveAndComposeImportMap,
-  resolveUrl,
-  resolveImportMap,
-  resolveIfNotPlainOrUrl,
-} from './resolve.js'
+import { resolveAndComposeImportMap, resolveUrl, resolveImportMap, resolveIfNotPlainOrUrl, asURL } from './resolve.js';
 import {
   baseUrl as pageBaseUrl,
+  dynamicImport,
   createBlob,
-  edge,
-  isURL,
   throwError,
-  setShimMode,
   shimMode,
   resolveHook,
   fetchHook,
+  importHook,
+  metaHook,
+  tsTransform,
   skip,
   revokeBlobURLs,
   noLoadEventRetriggers,
   cssModulesEnabled,
   jsonModulesEnabled,
+  wasmModulesEnabled,
+  sourcePhaseEnabled,
   onpolyfill,
   enforceIntegrity,
+  fromParent,
+  esmsInitOptions,
+  hasDocument,
+  typescriptEnabled
 } from './env.js';
-import { dynamicImport } from './dynamic-import-csp.js';
 import {
-  featureDetectionPromise,
-  supportsDynamicImport,
-  supportsImportMeta,
   supportsImportMaps,
-  supportsCssAssertions,
-  supportsJsonAssertions,
+  supportsCssType,
+  supportsJsonType,
+  supportsWasmModules,
+  supportsSourcePhase,
+  supportsMultipleImportMaps,
+  featureDetectionPromise
 } from './features.js';
 import * as lexer from '../node_modules/es-module-lexer/dist/lexer.asm.js';
 
-async function defaultResolve (id, parentUrl) {
-  return resolveImportMap(importMap, resolveIfNotPlainOrUrl(id, parentUrl) || id, parentUrl);
+function _resolve(id, parentUrl = pageBaseUrl) {
+  const urlResolved = resolveIfNotPlainOrUrl(id, parentUrl) || asURL(id);
+  let composedFallback = false;
+  const firstResolved = firstImportMap && resolveImportMap(firstImportMap, urlResolved || id, parentUrl);
+  const composedResolved =
+    composedImportMap === firstImportMap ? firstResolved : (
+      resolveImportMap(composedImportMap, urlResolved || id, parentUrl)
+    );
+  const resolved = composedResolved || firstResolved || throwUnresolved(id, parentUrl);
+  // needsShim, shouldShim per load record to set on parent
+  let n = false,
+    N = false;
+  if (!supportsImportMaps) {
+    // bare specifier -> needs shim
+    if (!urlResolved) n = true;
+    // url mapping -> should shim
+    else if (urlResolved !== resolved) N = true;
+  } else if (!supportsMultipleImportMaps) {
+    // bare specifier and not resolved by first import map -> needs shim
+    if (!urlResolved && !firstResolved) n = true;
+    // resolution doesn't match first import map -> should shim
+    if (firstResolved && resolved !== firstResolved) N = true;
+  }
+  return { r: resolved, n, N };
 }
 
-async function _resolve (id, parentUrl) {
-  const urlResolved = resolveIfNotPlainOrUrl(id, parentUrl);
-  return {
-    r: resolveImportMap(importMap, urlResolved || id, parentUrl),
-    // b = bare specifier
-    b: !urlResolved && !isURL(id)
+const resolve =
+  resolveHook ?
+    (id, parentUrl = pageBaseUrl) => {
+      const result = resolveHook(id, parentUrl, defaultResolve);
+      return result ? { r: result, n: true, N: true } : _resolve(id, parentUrl);
+    }
+  : _resolve;
+
+async function importHandler(id, opts, parentUrl = pageBaseUrl, sourcePhase) {
+  await initPromise; // needed for shim check
+  if (self.ESMS_DEBUG)
+    console.info(
+      `es-module-shims: importShim${sourcePhase ? '.source' : ''}("${id}"${opts ? ', ' + JSON.stringify(opts) : ''})`
+    );
+  if (importHook) await importHook(id, opts, parentUrl);
+  if (shimMode || !baselinePassthrough) {
+    if (hasDocument) processScriptsAndPreloads();
+    legacyAcceptingImportMaps = false;
+  }
+  await importMapPromise;
+  return resolve(id, parentUrl).r;
+}
+
+// import()
+async function importShim(id, opts, parentUrl) {
+  if (typeof opts === 'string') {
+    parentUrl = opts;
+    opts = undefined;
+  }
+  // we mock import('./x.css', { with: { type: 'css' }}) support via an inline static reexport
+  // because we can't syntactically pass through to dynamic import with a second argument in this libarary
+  let url = await importHandler(id, opts, parentUrl, false);
+  let source = null;
+  if (typeof opts === 'object' && typeof opts.with === 'object' && typeof opts.with.type === 'string') {
+    source = `export{default}from'${url}'with{type:"${opts.with.type}"}`;
+    url += '?entry';
+  }
+  return topLevelLoad(url, { credentials: 'same-origin' }, source, undefined, undefined);
+}
+
+// import.source()
+// (opts not currently supported as no use cases yet)
+if (shimMode || sourcePhaseEnabled)
+  importShim.source = async function importShimSource(specifier, opts, parentUrl) {
+    if (typeof opts === 'string') {
+      parentUrl = opts;
+      opts = undefined;
+    }
+    const url = await importHandler(specifier, opts, parentUrl, true);
+    const load = getOrCreateLoad(url, { credentials: 'same-origin' }, null, null);
+    if (firstPolyfillLoad && !shimMode && load.n && nativelyLoaded) {
+      onpolyfill();
+      firstPolyfillLoad = false;
+    }
+    await load.f;
+    return importShim._s[load.r];
   };
+
+self.importShim = importShim;
+
+function defaultResolve(id, parentUrl) {
+  return (
+    resolveImportMap(composedImportMap, resolveIfNotPlainOrUrl(id, parentUrl) || id, parentUrl) ||
+    throwUnresolved(id, parentUrl)
+  );
 }
 
-const resolve = resolveHook ? async (id, parentUrl) => ({ r: await resolveHook(id, parentUrl, defaultResolve), b: false }) : _resolve;
-
-const registry = {};
-if (self.ESMS_DEBUG) {
-  self._esmsr = registry;
+function throwUnresolved(id, parentUrl) {
+  throw Error(`Unable to resolve specifier '${id}'${fromParent(parentUrl)}`);
 }
 
-async function loadAll (load, seen) {
-  if (load.b || seen[load.u])
-    return;
+function metaResolve(id, parentUrl = this.url) {
+  return resolve(id, `${parentUrl}`).r;
+}
+
+importShim.resolve = (id, parentUrl) => resolve(id, parentUrl).r;
+importShim.getImportMap = () => JSON.parse(JSON.stringify(composedImportMap));
+importShim.addImportMap = importMapIn => {
+  if (!shimMode) throw new Error('Unsupported in polyfill mode.');
+  composedImportMap = resolveAndComposeImportMap(importMapIn, pageBaseUrl, composedImportMap);
+};
+
+const registry = (importShim._r = {});
+const sourceCache = (importShim._s = {});
+
+async function loadAll(load, seen) {
   seen[load.u] = 1;
   await load.L;
-  await Promise.all(load.d.map(dep => loadAll(dep, seen)));
-  if (!load.n)
-    load.n = load.d.some(dep => dep.n);
+  await Promise.all(
+    load.d.map(({ l: dep, s: sourcePhase }) => {
+      if (dep.b || seen[dep.u]) return;
+      if (sourcePhase) return dep.f;
+      return loadAll(dep, seen);
+    })
+  );
 }
 
-let importMap = { imports: {}, scopes: {} };
-let importMapSrcOrLazy = false;
+let importMapSrc = false;
+let multipleImportMaps = false;
+let firstImportMap = null;
+// To support polyfilling multiple import maps, we separately track the composed import map from the first import map
+let composedImportMap = { imports: {}, scopes: {}, integrity: {} };
 let baselinePassthrough;
 
 const initPromise = featureDetectionPromise.then(() => {
-  // shim mode is determined on initialization, no late shim mode
-  if (!shimMode) {
-    if (document.querySelectorAll('script[type=module-shim],script[type=importmap-shim],link[rel=modulepreload-shim]').length) {
-      setShimMode();
-    }
-    else {
-      let seenScript = false;
-      for (const script of document.querySelectorAll('script[type=module],script[type=importmap]')) {
-        if (!seenScript) {
-          if (script.type === 'module')
-            seenScript = true;
-        }
-        else if (script.type === 'importmap') {
-          importMapSrcOrLazy = true;
-          break;
-        }
+  baselinePassthrough =
+    esmsInitOptions.polyfillEnable !== true &&
+    supportsImportMaps &&
+    (!jsonModulesEnabled || supportsJsonType) &&
+    (!cssModulesEnabled || supportsCssType) &&
+    (!wasmModulesEnabled || supportsWasmModules) &&
+    (!sourcePhaseEnabled || supportsSourcePhase) &&
+    (!multipleImportMaps || supportsMultipleImportMaps) &&
+    !importMapSrc &&
+    !typescriptEnabled;
+  if (
+    !shimMode &&
+    sourcePhaseEnabled &&
+    typeof WebAssembly !== 'undefined' &&
+    !Object.getPrototypeOf(WebAssembly.Module).name
+  ) {
+    const s = Symbol();
+    const brand = m =>
+      Object.defineProperty(m, s, { writable: false, configurable: false, value: 'WebAssembly.Module' });
+    class AbstractModuleSource {
+      get [Symbol.toStringTag]() {
+        if (this[s]) return this[s];
+        throw new TypeError('Not an AbstractModuleSource');
       }
     }
+    const { Module: wasmModule, compile: wasmCompile, compileStreaming: wasmCompileStreaming } = WebAssembly;
+    WebAssembly.Module = Object.setPrototypeOf(
+      Object.assign(function Module(...args) {
+        return brand(new wasmModule(...args));
+      }, wasmModule),
+      AbstractModuleSource
+    );
+    WebAssembly.Module.prototype = Object.setPrototypeOf(wasmModule.prototype, AbstractModuleSource.prototype);
+    WebAssembly.compile = function compile(...args) {
+      return wasmCompile(...args).then(brand);
+    };
+    WebAssembly.compileStreaming = function compileStreaming(...args) {
+      return wasmCompileStreaming(...args).then(brand);
+    };
   }
-  baselinePassthrough = supportsDynamicImport && supportsImportMeta && supportsImportMaps && (!jsonModulesEnabled || supportsJsonAssertions) && (!cssModulesEnabled || supportsCssAssertions) && !importMapSrcOrLazy && !self.ESMS_DEBUG;
-  if (shimMode || !baselinePassthrough) {
-    new MutationObserver(mutations => {
-      for (const mutation of mutations) {
-        if (mutation.type !== 'childList') continue;
-        for (const node of mutation.addedNodes) {
-          if (node.tagName === 'SCRIPT') {
-            if (node.type === (shimMode ? 'module-shim' : 'module'))
-              processScript(node);
-            if (node.type === (shimMode ? 'importmap-shim' : 'importmap'))
-              processImportMap(node);
+  if (hasDocument) {
+    if (!supportsImportMaps) {
+      const supports = HTMLScriptElement.supports || (type => type === 'classic' || type === 'module');
+      HTMLScriptElement.supports = type => type === 'importmap' || supports(type);
+    }
+    if (shimMode || !baselinePassthrough) {
+      attachMutationObserver();
+      if (document.readyState === 'complete') {
+        readyStateCompleteCheck();
+      } else {
+        async function readyListener() {
+          await initPromise;
+          processScriptsAndPreloads();
+          if (document.readyState === 'complete') {
+            readyStateCompleteCheck();
+            document.removeEventListener('readystatechange', readyListener);
           }
-          else if (node.tagName === 'LINK' && node.rel === (shimMode ? 'modulepreload-shim' : 'modulepreload'))
-            processPreload(node);
+        }
+        document.addEventListener('readystatechange', readyListener);
+      }
+    }
+    processScriptsAndPreloads();
+  }
+  return lexer.init;
+});
+
+function attachMutationObserver() {
+  const observer = new MutationObserver(mutations => {
+    for (const mutation of mutations) {
+      if (mutation.type !== 'childList') continue;
+      for (const node of mutation.addedNodes) {
+        if (node.tagName === 'SCRIPT') {
+          if (node.type === (shimMode ? 'module-shim' : 'module') && !node.ep) processScript(node, true);
+          if (node.type === (shimMode ? 'importmap-shim' : 'importmap') && !node.ep) processImportMap(node, true);
+        } else if (
+          node.tagName === 'LINK' &&
+          node.rel === (shimMode ? 'modulepreload-shim' : 'modulepreload') &&
+          !node.ep
+        ) {
+          processPreload(node);
         }
       }
-    }).observe(document, { childList: true, subtree: true });
-    processImportMaps();
-    processScriptsAndPreloads();
-    return lexer.init;
-  }
-});
+    }
+  });
+  observer.observe(document, { childList: true });
+  observer.observe(document.head, { childList: true });
+  processScriptsAndPreloads();
+}
+
 let importMapPromise = initPromise;
 let firstPolyfillLoad = true;
-let acceptingImportMaps = true;
+let legacyAcceptingImportMaps = true;
 
-async function topLevelLoad (url, fetchOpts, source, nativelyLoaded, lastStaticLoadPromise) {
-  if (!shimMode)
-    acceptingImportMaps = false;
+async function topLevelLoad(url, fetchOpts, source, nativelyLoaded, lastStaticLoadPromise) {
+  legacyAcceptingImportMaps = false;
+  await initPromise;
   await importMapPromise;
+  if (importHook) await importHook(url, typeof fetchOpts !== 'string' ? fetchOpts : {}, '');
   // early analysis opt-out - no need to even fetch if we have feature support
   if (!shimMode && baselinePassthrough) {
+    if (self.ESMS_DEBUG) console.info(`es-module-shims: early exit for ${url} due to baseline modules support`);
     // for polyfill case, only dynamic import needs a return value here, and dynamic import will never pass nativelyLoaded
-    if (nativelyLoaded)
-      return null;
+    if (nativelyLoaded) return null;
     await lastStaticLoadPromise;
-    return dynamicImport(source ? createBlob(source) : url, { errUrl: url || source });
+    return dynamicImport(source ? createBlob(source) : url, url || source);
   }
   const load = getOrCreateLoad(url, fetchOpts, null, source);
+  linkLoad(load, fetchOpts);
   const seen = {};
   await loadAll(load, seen);
-  lastLoad = undefined;
   resolveDeps(load, seen);
   await lastStaticLoadPromise;
-  if (source && !shimMode && !load.n && !self.ESMS_DEBUG) {
-    const module = await dynamicImport(createBlob(source), { errUrl: source });
-    if (revokeBlobURLs) revokeObjectURLs(Object.keys(seen));
-    return module;
+  if (!shimMode && !load.n) {
+    if (nativelyLoaded) {
+      if (self.ESMS_DEBUG)
+        console.info(
+          `es-module-shims: early exit after graph analysis of ${url} - graph ran natively without needing polyfill`
+        );
+      return;
+    }
+    if (source) {
+      return await dynamicImport(createBlob(source), source);
+    }
   }
   if (firstPolyfillLoad && !shimMode && load.n && nativelyLoaded) {
     onpolyfill();
     firstPolyfillLoad = false;
   }
-  const module = await dynamicImport(!shimMode && !load.n && nativelyLoaded ? load.u : load.b, { errUrl: load.u });
+  const module = await (!shimMode && !load.n && !load.N ? import(load.u) : dynamicImport(load.b, load.u));
   // if the top-level load is a shell, run its update function
-  if (load.s)
-    (await dynamicImport(load.s)).u$_(module);
+  if (load.s) (await dynamicImport(load.s, load.u)).u$_(module);
   if (revokeBlobURLs) revokeObjectURLs(Object.keys(seen));
   // when tla is supported, this should return the tla promise as an actual handle
   // so readystate can still correspond to the sync subgraph exec completions
@@ -157,198 +310,304 @@ function revokeObjectURLs(registryKeys) {
   schedule(cleanup);
   function cleanup() {
     const batchStartIndex = batch * 100;
-    if (batchStartIndex > keysLength) return
+    if (batchStartIndex > keysLength) return;
     for (const key of registryKeys.slice(batchStartIndex, batchStartIndex + 100)) {
       const load = registry[key];
-      if (load) URL.revokeObjectURL(load.b);
+      if (load && load.b) URL.revokeObjectURL(load.b);
     }
     batch++;
     schedule(cleanup);
   }
 }
 
-async function importShim (id, ...args) {
-  // parentUrl if present will be the last argument
-  let parentUrl = args[args.length - 1];
-  if (typeof parentUrl !== 'string') {
-    parentUrl = pageBaseUrl;
-  }
-  // needed for shim check
-  await initPromise;
-  if (acceptingImportMaps || shimMode || !baselinePassthrough) {
-    processImportMaps();
-    if (!shimMode)
-      acceptingImportMaps = false;
-  }
-  await importMapPromise;
-  return topLevelLoad((await resolve(id, parentUrl)).r || throwUnresolved(id, parentUrl), { credentials: 'same-origin' });
-}
-
-self.importShim = importShim;
-
-if (shimMode) {
-  importShim.getImportMap = () => JSON.parse(JSON.stringify(importMap));
-}
-
-const meta = {};
-
-async function importMetaResolve (id, parentUrl = this.url) {
-  return (await resolve(id, `${parentUrl}`)).r || throwUnresolved(id, parentUrl);
-}
-
-self._esmsm = meta;
-
-function urlJsString (url) {
+function urlJsString(url) {
   return `'${url.replace(/'/g, "\\'")}'`;
 }
 
-let lastLoad;
-function resolveDeps (load, seen) {
-  if (load.b || !seen[load.u])
-    return;
+function resolveDeps(load, seen) {
+  if (load.b || !seen[load.u]) return;
   seen[load.u] = 0;
 
-  for (const dep of load.d)
-    resolveDeps(dep, seen);
+  for (const { l: dep, s: sourcePhase } of load.d) {
+    if (!sourcePhase) resolveDeps(dep, seen);
+  }
 
-  const [imports] = load.a;
+  if (!load.n) load.n = load.d.some(dep => dep.l.n);
+  if (!load.N) load.N = load.d.some(dep => dep.l.N);
+
+  // use native loader whenever possible (n = needs shim) via executable subgraph passthrough
+  // so long as the module doesn't use dynamic import or unsupported URL mappings (N = should shim)
+  if (!shimMode && !load.n && !load.N) {
+    load.b = load.u;
+    load.S = undefined;
+    return;
+  }
+
+  if (self.ESMS_DEBUG) console.info(`es-module-shims: polyfilling ${load.u}`);
+
+  const [imports, exports] = load.a;
 
   // "execution"
   const source = load.S;
 
-  // edge doesnt execute sibling in order, so we fix this up by ensuring all previous executions are explicit dependencies
-  let resolvedSource = edge && lastLoad ? `import '${lastLoad}';` : '';
+  let resolvedSource = '';
 
-  if (!imports.length) {
-    resolvedSource += source;
-  }
-  else {
-    // once all deps have loaded we can inline the dependency resolution blobs
-    // and define this blob
-    let lastIndex = 0, depIndex = 0;
-    for (const { s: start, e: end, se: statementEnd, d: dynamicImportIndex } of imports) {
-      // dependency source replacements
-      if (dynamicImportIndex === -1) {
-        const depLoad = load.d[depIndex++];
-        let blobUrl = depLoad.b;
-        if (!blobUrl) {
-          // circular shell creation
-          if (!(blobUrl = depLoad.s)) {
-            blobUrl = depLoad.s = createBlob(`export function u$_(m){${
-              depLoad.a[1].map(
-                name => name === 'default' ? `$_default=m.default` : `${name}=m.${name}`
-              ).join(',')
-            }}${
-              depLoad.a[1].map(name =>
-                name === 'default' ? `let $_default;export{$_default as default}` : `export let ${name}`
-              ).join(';')
-            }\n//# sourceURL=${depLoad.r}?cycle`);
-          }
-        }
-        // circular shell execution
-        else if (depLoad.s) {
-          resolvedSource += `${source.slice(lastIndex, start - 1)}/*${source.slice(start - 1, statementEnd)}*/${urlJsString(blobUrl)};import*as m$_${depIndex} from'${depLoad.b}';import{u$_ as u$_${depIndex}}from'${depLoad.s}';u$_${depIndex}(m$_${depIndex})`;
-          lastIndex = statementEnd;
-          depLoad.s = undefined;
-          continue;
-        }
-        resolvedSource += `${source.slice(lastIndex, start - 1)}/*${source.slice(start - 1, statementEnd)}*/${urlJsString(blobUrl)}`;
-        lastIndex = statementEnd;
-      }
-      // import.meta
-      else if (dynamicImportIndex === -2) {
-        meta[load.r] = { url: load.r, resolve: importMetaResolve };
-        resolvedSource += `${source.slice(lastIndex, start)}self._esmsm[${urlJsString(load.r)}]`;
-        lastIndex = statementEnd;
-      }
-      // dynamic import
-      else {
-        resolvedSource += `${source.slice(lastIndex, dynamicImportIndex + 6)}Shim(${source.slice(start, statementEnd)}, ${urlJsString(load.r)}`;
-        lastIndex = statementEnd;
-      }
+  // once all deps have loaded we can inline the dependency resolution blobs
+  // and define this blob
+  let lastIndex = 0,
+    depIndex = 0,
+    dynamicImportEndStack = [];
+  function pushStringTo(originalIndex) {
+    while (dynamicImportEndStack[dynamicImportEndStack.length - 1] < originalIndex) {
+      const dynamicImportEnd = dynamicImportEndStack.pop();
+      resolvedSource += `${source.slice(lastIndex, dynamicImportEnd)}, ${urlJsString(load.r)}`;
+      lastIndex = dynamicImportEnd;
     }
-
-    resolvedSource += source.slice(lastIndex);
+    resolvedSource += source.slice(lastIndex, originalIndex);
+    lastIndex = originalIndex;
   }
 
-  let hasSourceURL = false;
-  resolvedSource = resolvedSource.replace(sourceMapURLRegEx, (match, isMapping, url) => (hasSourceURL = !isMapping, match.replace(url, () => new URL(url, load.r))));
-  if (!hasSourceURL)
-    resolvedSource += '\n//# sourceURL=' + load.r;
+  for (const { s: start, e: end, ss: statementStart, se: statementEnd, d: dynamicImportIndex, t, a } of imports) {
+    // source phase
+    if (t === 4) {
+      let { l: depLoad } = load.d[depIndex++];
+      pushStringTo(statementStart);
+      resolvedSource += 'import ';
+      lastIndex = statementStart + 14;
+      pushStringTo(start - 1);
+      resolvedSource += `/*${source.slice(start - 1, end + 1)}*/'${createBlob(`export default importShim._s[${urlJsString(depLoad.r)}]`)}'`;
+      lastIndex = end + 1;
+    }
+    // dependency source replacements
+    else if (dynamicImportIndex === -1) {
+      let { l: depLoad } = load.d[depIndex++],
+        blobUrl = depLoad.b,
+        cycleShell = !blobUrl;
+      if (cycleShell) {
+        // circular shell creation
+        if (!(blobUrl = depLoad.s)) {
+          blobUrl = depLoad.s = createBlob(
+            `export function u$_(m){${depLoad.a[1]
+              .map(({ s, e }, i) => {
+                const q = depLoad.S[s] === '"' || depLoad.S[s] === "'";
+                return `e$_${i}=m${q ? `[` : '.'}${depLoad.S.slice(s, e)}${q ? `]` : ''}`;
+              })
+              .join(',')}}${
+              depLoad.a[1].length ? `let ${depLoad.a[1].map((_, i) => `e$_${i}`).join(',')};` : ''
+            }export {${depLoad.a[1]
+              .map(({ s, e }, i) => `e$_${i} as ${depLoad.S.slice(s, e)}`)
+              .join(',')}}\n//# sourceURL=${depLoad.r}?cycle`
+          );
+        }
+      }
 
-  load.b = lastLoad = createBlob(resolvedSource);
+      // strip import assertions unless we support them
+      const stripAssertion = (!supportsCssType && !supportsJsonType) || !(a > 0);
+
+      pushStringTo(start - 1);
+      resolvedSource += `/*${source.slice(start - 1, end + 1)}*/'${blobUrl}'`;
+
+      // circular shell execution
+      if (!cycleShell && depLoad.s) {
+        resolvedSource += `;import*as m$_${depIndex} from'${depLoad.b}';import{u$_ as u$_${depIndex}}from'${depLoad.s}';u$_${depIndex}(m$_${depIndex})`;
+        depLoad.s = undefined;
+      }
+      lastIndex = stripAssertion ? statementEnd : end + 1;
+    }
+    // import.meta
+    else if (dynamicImportIndex === -2) {
+      load.m = { url: load.r, resolve: metaResolve };
+      metaHook(load.m, load.u);
+      pushStringTo(start);
+      resolvedSource += `importShim._r[${urlJsString(load.u)}].m`;
+      lastIndex = statementEnd;
+    }
+    // dynamic import
+    else {
+      pushStringTo(statementStart + 6);
+      resolvedSource += `Shim${t === 5 ? '.source' : ''}(`;
+      dynamicImportEndStack.push(statementEnd - 1);
+      lastIndex = start;
+    }
+  }
+
+  // support progressive cycle binding updates (try statement avoids tdz errors)
+  if (load.s && (imports.length === 0 || imports[imports.length - 1].d === -1))
+    resolvedSource += `\n;import{u$_}from'${load.s}';try{u$_({${exports
+      .filter(e => e.ln)
+      .map(({ s, e, ln }) => `${source.slice(s, e)}:${ln}`)
+      .join(',')}})}catch(_){};\n`;
+
+  function pushSourceURL(commentPrefix, commentStart) {
+    const urlStart = commentStart + commentPrefix.length;
+    const commentEnd = source.indexOf('\n', urlStart);
+    const urlEnd = commentEnd !== -1 ? commentEnd : source.length;
+    let sourceUrl = source.slice(urlStart, urlEnd);
+    try {
+      sourceUrl = new URL(sourceUrl, load.r).href;
+    } catch {}
+    pushStringTo(urlStart);
+    resolvedSource += sourceUrl;
+    lastIndex = urlEnd;
+  }
+
+  let sourceURLCommentStart = source.lastIndexOf(sourceURLCommentPrefix);
+  let sourceMapURLCommentStart = source.lastIndexOf(sourceMapURLCommentPrefix);
+
+  // ignore sourceMap comments before already spliced code
+  if (sourceURLCommentStart < lastIndex) sourceURLCommentStart = -1;
+  if (sourceMapURLCommentStart < lastIndex) sourceMapURLCommentStart = -1;
+
+  // sourceURL first / only
+  if (
+    sourceURLCommentStart !== -1 &&
+    (sourceMapURLCommentStart === -1 || sourceMapURLCommentStart > sourceURLCommentStart)
+  ) {
+    pushSourceURL(sourceURLCommentPrefix, sourceURLCommentStart);
+  }
+  // sourceMappingURL
+  if (sourceMapURLCommentStart !== -1) {
+    pushSourceURL(sourceMapURLCommentPrefix, sourceMapURLCommentStart);
+    // sourceURL last
+    if (sourceURLCommentStart !== -1 && sourceURLCommentStart > sourceMapURLCommentStart)
+      pushSourceURL(sourceURLCommentPrefix, sourceURLCommentStart);
+  }
+
+  pushStringTo(source.length);
+
+  if (sourceURLCommentStart === -1) resolvedSource += sourceURLCommentPrefix + load.r;
+
+  load.b = createBlob(resolvedSource);
   load.S = undefined;
 }
 
-// ; and // trailer support added for Ruby on Rails 7 source maps compatibility
-// https://github.com/guybedford/es-module-shims/issues/228
-const sourceMapURLRegEx = /\n\/\/# source(Mapping)?URL=([^\n]+)\s*((;|\/\/[^#][^\n]*)\s*)*$/;
+const sourceURLCommentPrefix = '\n//# sourceURL=';
+const sourceMapURLCommentPrefix = '\n//# sourceMappingURL=';
 
 const jsContentType = /^(text|application)\/(x-)?javascript(;|$)/;
+const wasmContentType = /^application\/wasm(;|$)/;
 const jsonContentType = /^(text|application)\/json(;|$)/;
 const cssContentType = /^(text|application)\/css(;|$)/;
+const tsContentType = /^application\/typescript(;|$)|/;
 
 const cssUrlRegEx = /url\(\s*(?:(["'])((?:\\.|[^\n\\"'])+)\1|((?:\\.|[^\s,"'()\\])+))\s*\)/g;
 
 // restrict in-flight fetches to a pool of 100
 let p = [];
 let c = 0;
-function pushFetchPool () {
-  if (++c > 100)
-    return new Promise(r => p.push(r));
+function pushFetchPool() {
+  if (++c > 100) return new Promise(r => p.push(r));
 }
-function popFetchPool () {
+function popFetchPool() {
   c--;
-  if (p.length)
-    p.shift()();
+  if (p.length) p.shift()();
 }
 
-function fromParent (parent) {
-  return parent ? ` imported from ${parent}` : '';
-}
-
-async function doFetch (url, fetchOpts, parent) {
-  if (enforceIntegrity && !fetchOpts.integrity)
-    throw Error(`No integrity for ${url}${fromParent(parent)}.`);
+async function doFetch(url, fetchOpts, parent) {
+  if (enforceIntegrity && !fetchOpts.integrity) throw Error(`No integrity for ${url}${fromParent(parent)}.`);
   const poolQueue = pushFetchPool();
   if (poolQueue) await poolQueue;
   try {
     var res = await fetchHook(url, fetchOpts);
-  }
-  catch (e) {
+  } catch (e) {
     e.message = `Unable to fetch ${url}${fromParent(parent)} - see network log for details.\n` + e.message;
     throw e;
-  }
-  finally {
+  } finally {
     popFetchPool();
   }
-  if (!res.ok)
-    throw Error(`${res.status} ${res.statusText} ${res.url}${fromParent(parent)}`);
+
+  if (!res.ok) {
+    const error = new TypeError(`${res.status} ${res.statusText} ${res.url}${fromParent(parent)}`);
+    error.response = res;
+    throw error;
+  }
   return res;
 }
 
-async function fetchModule (url, fetchOpts, parent) {
-  const res = await doFetch(url, fetchOpts, parent);
-  const contentType = res.headers.get('content-type');
-  if (jsContentType.test(contentType))
-    return { r: res.url, s: await res.text(), t: 'js' };
-  else if (jsonContentType.test(contentType))
-    return { r: res.url, s: `export default ${await res.text()}`, t: 'json' };
-  else if (cssContentType.test(contentType)) {
-    return { r: res.url, s: `var s=new CSSStyleSheet();s.replaceSync(${
-      JSON.stringify((await res.text()).replace(cssUrlRegEx, (_match, quotes = '', relUrl1, relUrl2) => `url(${quotes}${resolveUrl(relUrl1 || relUrl2, url)}${quotes})`))
-    });export default s;`, t: 'css' };
-  }
-  else
-    throw Error(`Unsupported Content-Type "${contentType}" loading ${url}${fromParent(parent)}. Modules must be served with a valid MIME type like application/javascript.`);
+let esmsTsTransform;
+async function initTs() {
+  const m = await import(tsTransform);
+  if (!esmsTsTransform) esmsTsTransform = m.transform;
 }
 
-function getOrCreateLoad (url, fetchOpts, parent, source) {
-  let load = registry[url];
-  if (load && !source)
-    return load;
+async function fetchModule(url, fetchOpts, parent) {
+  const mapIntegrity = composedImportMap.integrity[url];
+  const res = await doFetch(
+    url,
+    mapIntegrity && !fetchOpts.integrity ? Object.assign({}, fetchOpts, { integrity: mapIntegrity }) : fetchOpts,
+    parent
+  );
+  const r = res.url;
+  const contentType = res.headers.get('content-type');
+  if (jsContentType.test(contentType)) return { r, s: await res.text(), t: 'js' };
+  else if (wasmContentType.test(contentType)) {
+    const module = await (sourceCache[r] || (sourceCache[r] = WebAssembly.compileStreaming(res)));
+    sourceCache[r] = module;
+    let s = '',
+      i = 0,
+      importObj = '';
+    for (const impt of WebAssembly.Module.imports(module)) {
+      const specifier = urlJsString(impt.module);
+      s += `import * as impt${i} from ${specifier};\n`;
+      importObj += `${specifier}:impt${i++},`;
+    }
+    i = 0;
+    s += `const instance = await WebAssembly.instantiate(importShim._s[${urlJsString(r)}], {${importObj}});\n`;
+    for (const expt of WebAssembly.Module.exports(module)) {
+      s += `export const ${expt.name} = instance.exports['${expt.name}'];\n`;
+    }
+    return { r, s, t: 'wasm' };
+  } else if (jsonContentType.test(contentType)) return { r, s: `export default ${await res.text()}`, t: 'json' };
+  else if (cssContentType.test(contentType)) {
+    return {
+      r,
+      s: `var s=new CSSStyleSheet();s.replaceSync(${JSON.stringify(
+        (await res.text()).replace(
+          cssUrlRegEx,
+          (_match, quotes = '', relUrl1, relUrl2) => `url(${quotes}${resolveUrl(relUrl1 || relUrl2, url)}${quotes})`
+        )
+      )});export default s;`,
+      t: 'css'
+    };
+  } else if (
+    (shimMode || typescriptEnabled) &&
+    (tsContentType.test(contentType) || url.endsWith('.ts') || url.endsWith('.mts'))
+  ) {
+    const source = await res.text();
+    if (!esmsTsTransform) await initTs();
+    const transformed = esmsTsTransform(source, url);
+    return { r, s: transformed === undefined ? source : transformed, t: transformed !== undefined ? 'ts' : 'js' };
+  } else
+    throw Error(
+      `Unsupported Content-Type "${contentType}" loading ${url}${fromParent(parent)}. Modules must be served with a valid MIME type like application/javascript.`
+    );
+}
 
-  load = {
+function isUnsupportedType(type) {
+  if (
+    (type === 'css' && !cssModulesEnabled) ||
+    (type === 'json' && !jsonModulesEnabled) ||
+    (type === 'wasm' && !wasmModulesEnabled) ||
+    (type === 'ts' && !typescriptEnabled)
+  )
+    throw featErr(`${type}-modules`);
+  return (
+    (type === 'css' && !supportsCssType) ||
+    (type === 'json' && !supportsJsonType) ||
+    (type === 'wasm' && !supportsWasmModules) ||
+    type === 'ts'
+  );
+}
+
+function getOrCreateLoad(url, fetchOpts, parent, source) {
+  if (source && registry[url]) {
+    let i = 0;
+    while (registry[url + ++i]);
+    url += i;
+  }
+  let load = registry[url];
+  if (load) return load;
+  registry[url] = load = {
     // url
     u: url,
     // response url
@@ -356,7 +615,7 @@ function getOrCreateLoad (url, fetchOpts, parent, source) {
     // fetchPromise
     f: undefined,
     // source
-    S: undefined,
+    S: source,
     // linkPromise
     L: undefined,
     // analysis
@@ -369,178 +628,215 @@ function getOrCreateLoad (url, fetchOpts, parent, source) {
     s: undefined,
     // needsShim
     n: false,
+    // shouldShim
+    N: false,
     // type
-    t: null
+    t: null,
+    // meta
+    m: null
   };
-  if (registry[url]) {
-    let i = 0;
-    while (registry[load.u + ++i]);
-    load.u += i;
-  }
-  registry[load.u] = load;
-
   load.f = (async () => {
-    if (!source) {
+    if (!load.S) {
       // preload fetch options override fetch options (race)
-      let t;
-      ({ r: load.r, s: source, t } = await (fetchCache[url] || fetchModule(url, fetchOpts, parent)));
-      if (t && !shimMode) {
-        if (t === 'css' && !cssModulesEnabled || t === 'json' && !jsonModulesEnabled)
-          throw Error(`${t}-modules require <script type="esms-options">{ "polyfillEnable": ["${t}-modules"] }<${''}/script>`);
-        if (t === 'css' && !supportsCssAssertions || t === 'json' && !supportsJsonAssertions)
-          load.n = true;
+      ({ r: load.r, s: load.S, t: load.t } = await (fetchCache[url] || fetchModule(url, fetchOpts, parent)));
+      if (!load.n && load.t !== 'js' && !shimMode && isUnsupportedType(load.t)) {
+        load.n = true;
       }
     }
     try {
-      load.a = lexer.parse(source, load.u);
+      load.a = lexer.parse(load.S, load.u);
+    } catch (e) {
+      throwError(e);
+      load.a = [[], [], false];
     }
-    catch (e) {
-      console.warn(e);
-      load.a = [[], []];
-    }
-    load.S = source;
     return load;
   })();
-
-  load.L = load.f.then(async () => {
-    let childFetchOpts = fetchOpts;
-    load.d = (await Promise.all(load.a[0].map(async ({ n, d }) => {
-      if (d >= 0 && !supportsDynamicImport || d === 2 && !supportsImportMeta)
-        load.n = true;
-      if (!n) return;
-      const { r, b } = await resolve(n, load.r || load.u);
-      if (b && (!supportsImportMaps || importMapSrcOrLazy))
-        load.n = true;
-      if (d !== -1) return;
-      if (!r)
-        throwUnresolved(n, load.r || load.u);
-      if (skip && skip.test(r)) return { b: r };
-      if (childFetchOpts.integrity)
-        childFetchOpts = Object.assign({}, childFetchOpts, { integrity: undefined });
-      return getOrCreateLoad(r, childFetchOpts, load.r).f;
-    }))).filter(l => l);
-  });
-
   return load;
 }
 
-function processScriptsAndPreloads () {
-  for (const script of document.querySelectorAll(shimMode ? 'script[type=module-shim]' : 'script[type=module]'))
-    processScript(script);
-  for (const link of document.querySelectorAll(shimMode ? 'link[rel=modulepreload-shim]' : 'link[rel=modulepreload]'))
-    processPreload(link);
+const featErr = feat =>
+  Error(
+    `${feat} feature must be enabled via <script type="esms-options">{ "polyfillEnable": ["${feat}"] }<${''}/script>`
+  );
+
+function linkLoad(load, fetchOpts) {
+  if (load.L) return;
+  load.L = load.f.then(async () => {
+    let childFetchOpts = fetchOpts;
+    load.d = load.a[0]
+      .map(({ n, d, t, a }) => {
+        const sourcePhase = t >= 4;
+        if (sourcePhase) {
+          if (!shimMode && !sourcePhaseEnabled) throw featErr('source-phase');
+          if (!supportsSourcePhase) load.n = true;
+        }
+        if (a > 0) {
+          if (!shimMode && !cssModulesEnabled && !jsonModulesEnabled) throw featErr('css-modules / json-modules');
+          if (!supportsCssType && !supportsJsonType) load.n = true;
+        }
+        if (d !== -1 || !n) return;
+        const resolved = resolve(n, load.r || load.u);
+        if (resolved.n) load.n = true;
+        if (d >= 0 || resolved.N) load.N = true;
+        if (d !== -1) return;
+        if (skip && skip(resolved.r) && !sourcePhase) return { l: { b: resolved.r }, s: false };
+        if (childFetchOpts.integrity) childFetchOpts = Object.assign({}, childFetchOpts, { integrity: undefined });
+        const child = { l: getOrCreateLoad(resolved.r, childFetchOpts, load.r, null), s: sourcePhase };
+        if (!child.s) linkLoad(child.l, fetchOpts);
+        // load, sourcePhase
+        return child;
+      })
+      .filter(l => l);
+  });
 }
 
-function processImportMaps () {
-  for (const script of document.querySelectorAll(shimMode ? 'script[type="importmap-shim"]' : 'script[type="importmap"]'))
-    processImportMap(script);
+function processScriptsAndPreloads() {
+  for (const link of document.querySelectorAll(shimMode ? 'link[rel=modulepreload-shim]' : 'link[rel=modulepreload]')) {
+    if (!link.ep) processPreload(link);
+  }
+  for (const script of document.querySelectorAll('script[type]')) {
+    if (script.type === 'importmap' + (shimMode ? '-shim' : '')) {
+      if (!script.ep) processImportMap(script);
+    } else if (script.type === 'module' + (shimMode ? '-shim' : '')) {
+      legacyAcceptingImportMaps = false;
+      if (!script.ep) processScript(script);
+    }
+  }
 }
 
-function getFetchOpts (script) {
+function getFetchOpts(script) {
   const fetchOpts = {};
-  if (script.integrity)
-    fetchOpts.integrity = script.integrity;
-  if (script.referrerpolicy)
-    fetchOpts.referrerPolicy = script.referrerpolicy;
-  if (script.crossorigin === 'use-credentials')
-    fetchOpts.credentials = 'include';
-  else if (script.crossorigin === 'anonymous')
-    fetchOpts.credentials = 'omit';
-  else
-    fetchOpts.credentials = 'same-origin';
+  if (script.integrity) fetchOpts.integrity = script.integrity;
+  if (script.referrerPolicy) fetchOpts.referrerPolicy = script.referrerPolicy;
+  if (script.fetchPriority) fetchOpts.priority = script.fetchPriority;
+  if (script.crossOrigin === 'use-credentials') fetchOpts.credentials = 'include';
+  else if (script.crossOrigin === 'anonymous') fetchOpts.credentials = 'omit';
+  else fetchOpts.credentials = 'same-origin';
   return fetchOpts;
 }
 
 let lastStaticLoadPromise = Promise.resolve();
 
 let domContentLoadedCnt = 1;
-function domContentLoadedCheck () {
-  if (--domContentLoadedCnt === 0 && !noLoadEventRetriggers)
+function domContentLoadedCheck() {
+  if (--domContentLoadedCnt === 0 && !noLoadEventRetriggers && (shimMode || !baselinePassthrough)) {
+    if (self.ESMS_DEBUG) console.info(`es-module-shims: DOMContentLoaded refire`);
     document.dispatchEvent(new Event('DOMContentLoaded'));
+  }
+}
+let loadCnt = 1;
+function loadCheck() {
+  if (--loadCnt === 0 && !noLoadEventRetriggers && (shimMode || !baselinePassthrough)) {
+    if (self.ESMS_DEBUG) console.info(`es-module-shims: load refire`);
+    window.dispatchEvent(new Event('load'));
+  }
 }
 // this should always trigger because we assume es-module-shims is itself a domcontentloaded requirement
-document.addEventListener('DOMContentLoaded', async () => {
-  await initPromise;
-  domContentLoadedCheck();
-  if (shimMode || !baselinePassthrough) {
-    processImportMaps();
-    processScriptsAndPreloads();
-  }
-});
-
-let readyStateCompleteCnt = 1;
-if (document.readyState === 'complete') {
-  readyStateCompleteCheck();
-}
-else {
-  document.addEventListener('readystatechange', async () => {
-    processImportMaps();
+if (hasDocument) {
+  document.addEventListener('DOMContentLoaded', async () => {
     await initPromise;
-    readyStateCompleteCheck();
+    domContentLoadedCheck();
+  });
+  window.addEventListener('load', async () => {
+    await initPromise;
+    loadCheck();
   });
 }
-function readyStateCompleteCheck () {
-  if (--readyStateCompleteCnt === 0 && !noLoadEventRetriggers)
+
+let readyStateCompleteCnt = 1;
+function readyStateCompleteCheck() {
+  if (--readyStateCompleteCnt === 0 && !noLoadEventRetriggers && (shimMode || !baselinePassthrough)) {
+    if (self.ESMS_DEBUG) console.info(`es-module-shims: readystatechange complete refire`);
     document.dispatchEvent(new Event('readystatechange'));
+  }
 }
 
-function processImportMap (script) {
-  if (script.ep) // ep marker = script processed
-    return;
-  // empty inline scripts sometimes show before domready
-  if (!script.src && !script.innerHTML)
-    return;
-  script.ep = true;
-  // we dont currently support multiple, external or dynamic imports maps in polyfill mode to match native
+const hasNext = script => script.nextSibling || (script.parentNode && hasNext(script.parentNode));
+const epCheck = (script, ready) =>
+  script.ep ||
+  (!ready && ((!script.src && !script.innerHTML) || !hasNext(script))) ||
+  script.getAttribute('noshim') !== null ||
+  !(script.ep = true);
+
+function processImportMap(script, ready = readyStateCompleteCnt > 0) {
+  if (epCheck(script, ready)) return;
+  if (self.ESMS_DEBUG) console.info(`es-module-shims: reading import map`);
+  // we dont currently support external import maps in polyfill mode to match native
   if (script.src) {
-    if (!shimMode)
-      return;
-    importMapSrcOrLazy = true;
+    if (!shimMode) return;
+    importMapSrc = true;
   }
-  if (acceptingImportMaps) {
-    importMapPromise = importMapPromise
-      .then(async () => {
-        importMap = resolveAndComposeImportMap(script.src ? await (await doFetch(script.src, getFetchOpts(script))).json() : JSON.parse(script.innerHTML), script.src || pageBaseUrl, importMap);
+  importMapPromise = importMapPromise
+    .then(async () => {
+      composedImportMap = resolveAndComposeImportMap(
+        script.src ? await (await doFetch(script.src, getFetchOpts(script))).json() : JSON.parse(script.innerHTML),
+        script.src || pageBaseUrl,
+        composedImportMap
+      );
+    })
+    .catch(e => {
+      if (e instanceof SyntaxError)
+        e = new Error(`Unable to parse import map ${e.message} in: ${script.src || script.innerHTML}`);
+      throwError(e);
+    });
+  if (!firstImportMap && legacyAcceptingImportMaps) importMapPromise.then(() => (firstImportMap = composedImportMap));
+  if (!legacyAcceptingImportMaps && !multipleImportMaps) {
+    multipleImportMaps = true;
+    if (!shimMode && baselinePassthrough && !supportsMultipleImportMaps) {
+      if (self.ESMS_DEBUG) console.info(`es-module-shims: disabling baseline passthrough due to multiple import maps`);
+      baselinePassthrough = false;
+      if (hasDocument) attachMutationObserver();
+    }
+  }
+  legacyAcceptingImportMaps = false;
+}
+
+function processScript(script, ready = readyStateCompleteCnt > 0) {
+  if (epCheck(script, ready)) return;
+  if (script.lang === 'ts' && !script.src) {
+    const source = script.innerHTML;
+    return initTs()
+      .then(() => {
+        const transformed = esmsTsTransform(source, pageBaseUrl);
+        if (transformed !== undefined) {
+          onpolyfill();
+          firstPolyfillLoad = false;
+        }
+        return topLevelLoad(
+          pageBaseUrl,
+          getFetchOpts(script),
+          transformed === undefined ? source : transformed,
+          transformed === undefined,
+          undefined
+        );
       })
       .catch(throwError);
-    if (!shimMode)
-      acceptingImportMaps = false;
   }
-}
-
-function processScript (script) {
-  if (script.ep) // ep marker = script processed
-    return;
-  if (script.getAttribute('noshim') !== null)
-    return;
-  // empty inline scripts sometimes show before domready
-  if (!script.src && !script.innerHTML)
-    return;
-  script.ep = true;
+  if (self.ESMS_DEBUG) console.info(`es-module-shims: checking script ${script.src || '<inline>'}`);
   // does this load block readystate complete
-  const isReadyScript = readyStateCompleteCnt > 0;
+  const isBlockingReadyScript = script.getAttribute('async') === null && readyStateCompleteCnt > 0;
   // does this load block DOMContentLoaded
   const isDomContentLoadedScript = domContentLoadedCnt > 0;
-  if (isReadyScript) readyStateCompleteCnt++;
+  const isLoadScript = loadCnt > 0;
+  if (isLoadScript) loadCnt++;
+  if (isBlockingReadyScript) readyStateCompleteCnt++;
   if (isDomContentLoadedScript) domContentLoadedCnt++;
-  const blocks = script.getAttribute('async') === null && isReadyScript;
-  const loadPromise = topLevelLoad(script.src || pageBaseUrl, getFetchOpts(script), !script.src && script.innerHTML, !shimMode, blocks && lastStaticLoadPromise).catch(throwError);
-  if (blocks)
-    lastStaticLoadPromise = loadPromise.then(readyStateCompleteCheck);
-  if (isDomContentLoadedScript)
-    loadPromise.then(domContentLoadedCheck);
+  const loadPromise = topLevelLoad(
+    script.src || pageBaseUrl,
+    getFetchOpts(script),
+    !script.src && script.innerHTML,
+    !shimMode,
+    isBlockingReadyScript && lastStaticLoadPromise
+  ).catch(throwError);
+  if (!noLoadEventRetriggers) loadPromise.then(() => script.dispatchEvent(new Event('load')));
+  if (isBlockingReadyScript) lastStaticLoadPromise = loadPromise.then(readyStateCompleteCheck);
+  if (isDomContentLoadedScript) loadPromise.then(domContentLoadedCheck);
+  if (isLoadScript) loadPromise.then(loadCheck);
 }
 
 const fetchCache = {};
-function processPreload (link) {
-  if (link.ep) // ep marker = processed
-    return;
+function processPreload(link) {
   link.ep = true;
-  if (fetchCache[link.href])
-    return;
+  if (fetchCache[link.href]) return;
   fetchCache[link.href] = fetchModule(link.href, getFetchOpts(link));
-}
-
-function throwUnresolved (id, parentUrl) {
-  throw Error(`Unable to resolve specifier '${id}'${fromParent(parentUrl)}`);
 }

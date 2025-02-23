@@ -1,0 +1,112 @@
+version = 0.1
+
+extensions = ['chomp@0.1:footprint', 'chomp@0.1:npm']
+
+[server]
+port = 8080
+root = "."
+
+[[task]]
+name = 'bench'
+run = 'chomp -c bench'
+
+[[task]]
+name = 'bench:clear'
+run = 'rm -rf bench/results'
+
+[[task]]
+name = 'format-check'
+deps = ['npm:install']
+run = 'prettier -c src/*.js'
+
+[[task]]
+name = 'format'
+deps = ['npm:install']
+run = 'prettier -w src/*.js'
+
+[[task]]
+deps = ['node_modules/amaro/dist/index.js']
+target = 'dist/es-module-shims-typescript.js'
+engine = 'node'
+run = '''
+  import { readFileSync, writeFileSync } from 'fs';
+  const amaroSource = readFileSync('node_modules/amaro/dist/index.js', 'utf8');
+
+  writeFileSync('dist/es-module-shims-typescript.js', `const module = {};
+function require(mod) {
+  switch (mod) {
+    case 'util': return { TextEncoder, TextDecoder };
+    case 'node:buffer': return { Buffer: { from: function (a) { return Uint8Array.from(atob(a), (x) => x.charCodeAt(0)); } } };
+    default: throw new Error('No impl for ' + mod);
+  }
+}
+${amaroSource}
+const amaroTransformSync = module.exports.transformSync;
+export function transform(source, url) {
+  try {
+    const transformed = amaroTransformSync(source, { filename: url, transform: { mode: 'strip-only', noEmptyExport: true } }).code;
+    // Importantly, return undefined when there is no work to do
+    if (transformed !== source)
+      return transformed;
+  } catch (e) {
+    // This is needed pending figuring out why filename option above isn't working
+    throw new SyntaxError(e.message.replace(',-', url + ' - '));
+  }
+}
+`);
+'''
+
+[[task]]
+name = 'build'
+deps = ['rollup', 'dist/es-module-shims-typescript.js']
+
+[[task]]
+name = 'rollup'
+targets = ['dist/es-module-shims.js', 'dist/es-module-shims.wasm.js', 'dist/es-module-shims.debug.js']
+deps = ['src/*.js', 'npm:install', 'README.md']
+run = 'rollup -c'
+
+[[task]]
+target = 'README.md'
+dep = 'package.json'
+engine = 'node'
+run = '''
+  import { readFileSync, writeFileSync } from 'fs';
+  const { version } = JSON.parse(readFileSync(process.env.DEP, 'utf8'));
+  const source = readFileSync(process.env.TARGET, 'utf8')
+    .replace(/es-module-shims@\d+.\d+.\d+/g, `es-module-shims@${version}`);
+  writeFileSync(process.env.TARGET, source);
+'''
+
+[[task]]
+name = 'footprint'
+deps = ['dist/es-module-shims.js', 'dist/es-module-shims.wasm.js']
+template = 'footprint'
+
+[[task]]
+name = 'test-watch'
+dep = 'test:watch:'
+
+[[task]]
+name = 'test-watch:#'
+serial = true
+env = { WATCH_MODE = 'true' }
+deps = ['npm:install', 'dist/es-module-shims.js', 'dist/es-module-shims.wasm.js', 'test/test-#.html']
+run = 'node test/server.mjs test-${{ MATCH }}'
+
+[[task]]
+name = 'test'
+dep = 'test:'
+
+[[task]]
+name = 'test:#'
+serial = true
+deps = ['npm:install', 'dist/es-module-shims.js', 'dist/es-module-shims.wasm.js', 'dist/es-module-shims-typescript.js', 'test/test-#.html']
+run = 'node test/server.mjs test-${{ MATCH }}'
+
+[[task]]
+name = 'test:firefox'
+env = { CI_BROWSER = 'C:\Program Files\Mozilla Firefox\firefox.exe', CI_BROWSER_FLAGS = '-headless', CI_BROWSER_FLUSH = 'taskkill /IM firefox.exe /F' }
+serial = true
+deps = ['npm:install', 'dist/es-module-shims.js', 'dist/es-module-shims.wasm.js', 'dist/es-module-shims-typescript.js', 'test/test-#.html']
+run = 'node test/server.mjs test-${{ MATCH }}'
